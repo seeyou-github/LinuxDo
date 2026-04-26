@@ -1,0 +1,95 @@
+name: Build Android arm64 APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-android-arm64:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.38.9'
+          cache: true
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Android build environment
+        run: |
+          rustup target add aarch64-linux-android
+          cargo install cargo-ndk
+          sudo apt-get update && sudo apt-get install -y cmake
+
+      - name: Setup Android NDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'ndk;25.2.9519653'
+
+      - name: Setup Android debug signing
+        run: |
+          keytool -genkeypair -v \
+            -keystore android/app/debug.keystore \
+            -storepass android \
+            -alias androiddebugkey \
+            -keypass android \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+          cat > android/key.properties <<'EOF'
+          storePassword=android
+          keyPassword=android
+          keyAlias=androiddebugkey
+          storeFile=debug.keystore
+          EOF
+
+      - name: Generate CA certificates
+        working-directory: core/doh_proxy
+        run: cargo run --bin gen_ca
+
+      - name: Build DOH Proxy
+        working-directory: core/doh_proxy
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/25.2.9519653
+        run: cargo ndk -t arm64-v8a --platform 28 build --release --features ech
+
+      - name: Copy native libraries
+        run: |
+          mkdir -p android/app/src/main/jniLibs/arm64-v8a
+          cp core/doh_proxy/target/aarch64-linux-android/release/libdoh_proxy.so android/app/src/main/jniLibs/arm64-v8a/
+          mkdir -p android/app/src/main/res/raw
+          cp core/doh_proxy/certs/ca.der android/app/src/main/res/raw/proxy_ca.der
+
+      - name: Generate l10n
+        run: bash scripts/gen_l10n.sh --merge
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Build Android APK
+        run: |
+          flutter build apk --release --target-platform android-arm64 --dart-define=cronetHttpNoPlay=true
+          mkdir -p dist
+          mv build/app/outputs/flutter-apk/app-release.apk dist/fluxdo-arm64-v8a.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: fluxdo-android-arm64-v8a-apk
+          path: dist/fluxdo-arm64-v8a.apk
+          if-no-files-found: error
+          overwrite: true
