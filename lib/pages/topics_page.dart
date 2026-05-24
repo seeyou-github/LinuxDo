@@ -122,6 +122,10 @@ class TopicsPage extends ConsumerStatefulWidget {
 class _TopicsPageState extends ConsumerState<TopicsPage>
     with TickerProviderStateMixin {
   late TabController _tabController;
+  late final ShortcutScopeBinding _tabShortcutBinding = ShortcutScopeBinding(
+    ref: ref,
+    scope: ShortcutScope.master,
+  );
   int _tabLength = 1; // 初始只有"全部"
   int _currentTabIndex = 0;
   List<int> _visiblePinnedIds = []; // 过滤后的可见分类 ID
@@ -145,23 +149,18 @@ class _TopicsPageState extends ConsumerState<TopicsPage>
 
   void _registerTabShortcuts() {
     if (!mounted) return;
-    ref
-        .read(masterShortcutsProvider.notifier)
-        .update(
-          (current) => {
-            ...current,
-            ShortcutAction.previousTab: () {
-              if (_tabController.index > 0) {
-                _tabController.animateTo(_tabController.index - 1);
-              }
-            },
-            ShortcutAction.nextTab: () {
-              if (_tabController.index < _tabController.length - 1) {
-                _tabController.animateTo(_tabController.index + 1);
-              }
-            },
-          },
-        );
+    _tabShortcutBinding.register(context, {
+      ShortcutAction.previousTab: () {
+        if (_tabController.index > 0) {
+          _tabController.animateTo(_tabController.index - 1);
+        }
+      },
+      ShortcutAction.nextTab: () {
+        if (_tabController.index < _tabController.length - 1) {
+          _tabController.animateTo(_tabController.index + 1);
+        }
+      },
+    });
   }
 
   @override
@@ -171,6 +170,9 @@ class _TopicsPageState extends ConsumerState<TopicsPage>
     _outerScrollController.dispose();
     _tabController.removeListener(_handleTabChange);
     _tabController.dispose();
+    if (PlatformUtils.isDesktop) {
+      _tabShortcutBinding.disposeDeferred();
+    }
     super.dispose();
   }
 
@@ -424,9 +426,7 @@ class _TopicsPageState extends ConsumerState<TopicsPage>
   }
 
   void _showDismissConfirmDialog(TopicListFilter currentFilter) {
-    final label = currentFilter == TopicListFilter.newTopics
-        ? context.l10n.topics_newTopics
-        : context.l10n.topics_unreadTopics;
+    final label = _dismissLabel(currentFilter);
     showAppDialog(
       context: context,
       builder: (context) => AlertDialog(
@@ -447,6 +447,21 @@ class _TopicsPageState extends ConsumerState<TopicsPage>
         ],
       ),
     );
+  }
+
+  String _dismissLabel(TopicListFilter filter) {
+    if (filter == TopicListFilter.newTopics) {
+      final subset = ref.read(topicNewSubsetProvider);
+      switch (subset) {
+        case NewSubset.topics:
+          return context.l10n.topic_filterNewTopicsShort;
+        case NewSubset.replies:
+          return context.l10n.topic_filterNewRepliesShort;
+        case NewSubset.all:
+          return context.l10n.topic_filterNewAllShort;
+      }
+    }
+    return context.l10n.topics_unreadTopics;
   }
 
   Future<void> _doDismiss() async {
@@ -509,7 +524,7 @@ class _TopicsPageState extends ConsumerState<TopicsPage>
     // 监听全局筛选/排序变化：刷新当前 tab，清除非活跃 tab 数据
     // 所有全局参数统一聚合在 topicListGlobalParamsSignal 中，
     // 未来新增参数只需在信号 provider 中添加 ref.watch
-    ref.listen(topicListGlobalParamsSignal, (_, __) {
+    ref.listen(topicListGlobalParamsSignal, (_, _) {
       _invalidateTopicTabs(pinnedIds);
     });
 
@@ -672,8 +687,7 @@ class _TopicsPageState extends ConsumerState<TopicsPage>
   bool _handleOuterScrollNotification(ScrollNotification notification) {
     // 追踪内层列表滚动，发布"距顶进度"到 NavActionBus 的 progress provider，
     // 底栏根据进度做动态图标切换（见 _ActiveDestinationIcon）。
-    if (notification.depth > 0 &&
-        notification.metrics.axis == Axis.vertical) {
+    if (notification.depth > 0 && notification.metrics.axis == Axis.vertical) {
       _publishHomeScrollProgress(notification.metrics.pixels);
     }
 
@@ -789,7 +803,8 @@ class _TopicsPageState extends ConsumerState<TopicsPage>
     final current = ref.read(navScrollProgressProvider(NavEntryIds.home));
     // 节流：变化 >= 4 像素 才更新；或跨越"回顶"阈值 / 过 0 时立即同步
     final atZero = progress == 0 && current != 0;
-    final crossed = (progress >= navScrollIconThreshold) !=
+    final crossed =
+        (progress >= navScrollIconThreshold) !=
         (current >= navScrollIconThreshold);
     if (!atZero && !crossed && (progress - current).abs() < 4.0) return;
     ref.read(navScrollProgressProvider(NavEntryIds.home).notifier).state =
@@ -1093,10 +1108,15 @@ class _TopicsHeaderDelegate extends SliverPersistentHeaderDelegate {
                     builder: (context, ref, _) {
                       final order = ref.watch(topicSortOrderProvider);
                       final ascending = ref.watch(topicSortAscendingProvider);
+                      final subset = ref.watch(topicNewSubsetProvider);
                       return SortAndTagsBar(
                         currentFilter: currentFilter,
                         isLoggedIn: isLoggedIn,
                         onFilterChanged: onFilterChanged,
+                        currentSubset: subset,
+                        onSubsetChanged: (s) => ref
+                            .read(topicNewSubsetProvider.notifier)
+                            .setSubset(s),
                         currentOrder: order,
                         ascending: ascending,
                         onOrderChanged: (o) => ref
@@ -1146,6 +1166,10 @@ class _TopicList extends ConsumerStatefulWidget {
 class _TopicListState extends ConsumerState<_TopicList>
     with AutomaticKeepAliveClientMixin {
   final _refreshIndicatorKey = GlobalKey<RefreshIndicatorState>();
+  late final ShortcutScopeBinding _listShortcutBinding = ShortcutScopeBinding(
+    ref: ref,
+    scope: ShortcutScope.master,
+  );
   bool _isLoadingNewTopics = false;
 
   /// 需要高亮的话题 IDs（loadBefore 插入后设置，渐变消失后清除）
@@ -1195,7 +1219,8 @@ class _TopicListState extends ConsumerState<_TopicList>
     final topics = topicsAsync.asData?.value;
     if (topics == null || topics.isEmpty) return;
 
-    final newIndex = (_keyboardFocusIndex + delta).clamp(0, topics.length - 1);
+    final anchorIndex = _resolveKeyboardAnchorIndex(topics);
+    final newIndex = (anchorIndex + delta).clamp(0, topics.length - 1);
     if (newIndex == _keyboardFocusIndex) return;
 
     setState(() => _keyboardFocusIndex = newIndex);
@@ -1229,9 +1254,10 @@ class _TopicListState extends ConsumerState<_TopicList>
   void _openFocusedTopic(AsyncValue<List<Topic>> topicsAsync) {
     final topics = topicsAsync.asData?.value;
     if (topics == null || topics.isEmpty) return;
-    if (_keyboardFocusIndex < 0 || _keyboardFocusIndex >= topics.length) return;
+    final focusIndex = _resolveKeyboardAnchorIndex(topics);
+    if (focusIndex < 0 || focusIndex >= topics.length) return;
 
-    final topic = topics[_keyboardFocusIndex];
+    final topic = topics[focusIndex];
     // 强制用 Navigator push 打开（而非 Master-Detail 内选中）
     Navigator.of(context).push(
       MaterialPageRoute(
@@ -1242,6 +1268,32 @@ class _TopicListState extends ConsumerState<_TopicList>
         ),
       ),
     );
+  }
+
+  int _resolveKeyboardAnchorIndex(List<Topic> topics) {
+    final selectedTopicId = ref.read(selectedTopicProvider).topicId;
+    final selectedIndex = selectedTopicId == null
+        ? -1
+        : topics.indexWhere((topic) => topic.id == selectedTopicId);
+
+    if (_keyboardFocusIndex >= 0 && _keyboardFocusIndex < topics.length) {
+      if (selectedIndex != -1 &&
+          topics[_keyboardFocusIndex].id != selectedTopicId) {
+        return selectedIndex;
+      }
+      return _keyboardFocusIndex;
+    }
+
+    if (selectedIndex != -1) {
+      return selectedIndex;
+    }
+
+    return -1;
+  }
+
+  void _syncKeyboardFocusToIndex(int index) {
+    if (_keyboardFocusIndex == index) return;
+    setState(() => _keyboardFocusIndex = index);
   }
 
   void _openTopic(Topic topic) {
@@ -1271,6 +1323,14 @@ class _TopicListState extends ConsumerState<_TopicList>
   }
 
   @override
+  void dispose() {
+    if (PlatformUtils.isDesktop) {
+      _listShortcutBinding.disposeDeferred();
+    }
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     super.build(context); // AutomaticKeepAliveClientMixin 需要
 
@@ -1286,7 +1346,7 @@ class _TopicListState extends ConsumerState<_TopicList>
       _cachedTopicsAsync = topicsAsync;
 
       // 以下 listener 仅当前 tab 需要
-      ref.listen(fabRefreshSignalProvider, (_, __) {
+      ref.listen(fabRefreshSignalProvider, (_, _) {
         _refreshIndicatorKey.currentState?.show();
       });
       ref.listen(tabTagsProvider(widget.categoryId), (prev, next) {
@@ -1295,7 +1355,7 @@ class _TopicListState extends ConsumerState<_TopicList>
           _clearIncomingState();
         }
       });
-      ref.listen(topicListGlobalParamsSignal, (_, __) {
+      ref.listen(topicListGlobalParamsSignal, (_, _) {
         _clearIncomingState();
       });
     } else {
@@ -1312,18 +1372,17 @@ class _TopicListState extends ConsumerState<_TopicList>
     if (PlatformUtils.isDesktop && isCurrentTab) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
-        ref
-            .read(masterShortcutsProvider.notifier)
-            .update(
-              (current) => {
-                ...current,
-                ShortcutAction.nextItem: () =>
-                    _moveKeyboardFocus(1, topicsAsync),
-                ShortcutAction.previousItem: () =>
-                    _moveKeyboardFocus(-1, topicsAsync),
-                ShortcutAction.openItem: () => _openFocusedTopic(topicsAsync),
-              },
-            );
+        _listShortcutBinding.register(context, {
+          ShortcutAction.nextItem: () => _moveKeyboardFocus(1, topicsAsync),
+          ShortcutAction.previousItem: () =>
+              _moveKeyboardFocus(-1, topicsAsync),
+          ShortcutAction.openItem: () => _openFocusedTopic(topicsAsync),
+        });
+      });
+    } else if (PlatformUtils.isDesktop) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _listShortcutBinding.clear();
       });
     }
 
@@ -1478,7 +1537,10 @@ class _TopicListState extends ConsumerState<_TopicList>
                           context: context,
                           topic: topic,
                           isSelected: topic.id == selectedTopicId,
-                          onTap: () => _openTopic(topic),
+                          onTap: () {
+                            _syncKeyboardFocusToIndex(topicIndex);
+                            _openTopic(topic);
+                          },
                           enableLongPress: enableLongPress,
                           highlightColor: color,
                         );
@@ -1490,7 +1552,10 @@ class _TopicListState extends ConsumerState<_TopicList>
                     context: context,
                     topic: topic,
                     isSelected: topic.id == selectedTopicId,
-                    onTap: () => _openTopic(topic),
+                    onTap: () {
+                      _syncKeyboardFocusToIndex(topicIndex);
+                      _openTopic(topic);
+                    },
                     enableLongPress: enableLongPress,
                   );
                 },

@@ -5,7 +5,6 @@ import 'package:catcher_2/catcher_2.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'l10n/app_localizations.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:window_manager/window_manager.dart';
@@ -14,12 +13,14 @@ import 'pages/topics_page.dart';
 import 'pages/data_management_page.dart';
 import 'providers/discourse_providers.dart';
 import 'providers/locale_provider.dart';
+import 'widgets/ai/builtin_presets_factory.dart';
 import 'providers/message_bus_providers.dart';
 import 'services/auth_issue_notice_service.dart';
 import 'services/discourse/discourse_service.dart';
 import 'providers/app_state_refresher.dart';
 import 'services/highlighter_service.dart';
 import 'widgets/common/notification_icon_button.dart';
+import 'widgets/common/clipboard_topic_link_snack_content.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'services/network/cookie/android_cdp_feature.dart';
 import 'services/network/cookie/csrf_token_service.dart';
@@ -29,6 +30,7 @@ import 'services/local_notification_service.dart';
 import 'services/data_management/cache_size_service.dart';
 import 'services/discourse_cache_manager.dart';
 import 'services/toast_service.dart';
+import 'widgets/common/loading_spinner.dart';
 import 'l10n/s.dart';
 
 import 'services/preloaded_data_service.dart';
@@ -42,9 +44,9 @@ import 'services/hcaptcha_accessibility_service.dart';
 import 'services/network/doh_proxy/proxy_certificate.dart';
 import 'services/cf_challenge_logger.dart';
 import 'services/cf_clearance_refresh_service.dart';
-import 'services/fingerprint_service.dart';
 import 'services/update_service.dart';
 import 'services/update_checker_helper.dart';
+import 'services/clipboard_topic_link_service.dart';
 import 'services/deep_link_service.dart';
 import 'services/background/background_notification_service.dart';
 import 'services/message_bus_service.dart';
@@ -135,8 +137,8 @@ Future<void> main() async {
       effect: Platform.isMacOS
           ? acrylic.WindowEffect.sidebar
           : Platform.isWindows
-              ? acrylic.WindowEffect.mica
-              : acrylic.WindowEffect.disabled,
+          ? acrylic.WindowEffect.mica
+          : acrylic.WindowEffect.disabled,
     );
     final isVisible = await windowManager.isVisible();
     await windowManager.setPreventClose(true);
@@ -178,11 +180,12 @@ Future<void> main() async {
   // WebView 适配器设置
   await WebViewAdapterSettingsService.instance.initialize(prefs);
   unawaited(
-    WebViewHttpAdapter()
-        .runStartupSessionCookieSelfCheckOnce()
-        .catchError((Object e, StackTrace _) {
-          debugPrint('[Main] WebView session cookie 自检失败: $e');
-        }),
+    WebViewHttpAdapter().runStartupSessionCookieSelfCheckOnce().catchError((
+      Object e,
+      StackTrace _,
+    ) {
+      debugPrint('[Main] WebView session cookie 自检失败: $e');
+    }),
   );
   try {
     final rhttp = await Future.any([
@@ -203,7 +206,8 @@ Future<void> main() async {
   HCaptchaAccessibilityService().initialize(prefs);
   CfClearanceRefreshService().initialize(prefs);
   try {
-    final initialConnectivity = await ConnectivityService.safeCheckConnectivity();
+    final initialConnectivity =
+        await ConnectivityService.safeCheckConnectivity();
     await VpnAutoToggleService.instance.syncInitialState(initialConnectivity);
   } catch (e) {
     debugPrint('[Main] 初始 VPN 状态同步失败: $e');
@@ -235,13 +239,7 @@ Future<void> main() async {
 
   // 提前触发预加载数据请求，与 runApp 并行执行
   // PreheatGate 中的 ensureLoaded() 会复用这个已在进行的请求
-  unawaited(
-    PreloadedDataService().ensureLoaded().then((_) {
-      if (PreloadedDataService().currentUserSync != null) {
-        unawaited(FingerprintService.instance.collectAndReport());
-      }
-    }).catchError((Object _) {}),
-  );
+  unawaited(PreloadedDataService().ensureLoaded().catchError((Object _) {}));
 
   // 记录应用启动日志
   LogWriter.instance.write({
@@ -267,6 +265,11 @@ Future<void> main() async {
     }
   });
 
+  // 注入自定义加载指示器
+  AiToastDelegate.configureLoading(({color, size = 48}) {
+    return LoadingSpinner(color: color, size: size);
+  });
+
   // 根据当前语言配置 AI 模型管理包的语言
   final savedLocale = prefs.getString('pref_locale');
   if (savedLocale != null && savedLocale != 'system') {
@@ -274,6 +277,9 @@ Future<void> main() async {
     AiL10n.configureLocale(
       Locale(parts[0], parts.length > 1 ? parts[1] : null),
     );
+    await LocaleSettings.setLocaleRaw(savedLocale);
+  } else {
+    await LocaleSettings.useDeviceLocale();
   }
 
   // 过滤 Flutter 框架已知 bug（https://github.com/flutter/flutter/issues/115787）
@@ -317,6 +323,14 @@ Future<void> main() async {
         aiDioAdapterFactoryProvider.overrideWithValue(
           createExternalHttpAdapter,
         ),
+        // 内置 PromptPreset 列表：在 override 函数内 watch localeProvider，
+        // locale 切换时整个 builtInPresetsProvider 重建 → 下游
+        // promptPresetListProvider 的 StateNotifier 重新构造 → preset i18n
+        // 文本随之刷新。
+        builtInPresetsProvider.overrideWith((ref) {
+          ref.watch(localeProvider);
+          return BuiltInPresetsFactory.create();
+        }),
       ],
       child: const MainApp(),
     ),
@@ -333,6 +347,9 @@ class MainApp extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final themeState = ref.watch(themeProvider);
+    ref.listen<Locale?>(localeProvider, (_, next) {
+      unawaited(_syncSlangLocale(next));
+    });
 
     return DynamicColorBuilder(
       builder: (lightDynamic, darkDynamic) {
@@ -373,107 +390,123 @@ class MainApp extends ConsumerWidget {
           );
         }
 
-        return MaterialApp(
-          navigatorKey: navigatorKey,
-          navigatorObservers: [appRouteObserver],
-          title: 'FluxDO',
-          locale: ref.watch(localeProvider),
-          localizationsDelegates: const [
-            AppLocalizations.delegate,
-            GlobalMaterialLocalizations.delegate,
-            GlobalWidgetsLocalizations.delegate,
-            GlobalCupertinoLocalizations.delegate,
-          ],
-          supportedLocales: AppLocalizations.supportedLocales,
-          themeMode: themeState.mode,
-          theme: ThemeData(
-            colorScheme: lightScheme,
-            useMaterial3: true,
-            fontFamily: themeState.fontFamilyName,
-            cardTheme: CardThemeData(
-              elevation: 0,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(12),
+        return TranslationProvider(
+          child: Builder(
+            builder: (context) => MaterialApp(
+              navigatorKey: navigatorKey,
+              navigatorObservers: [appRouteObserver],
+              title: 'FluxDO',
+              locale: TranslationProvider.of(context).flutterLocale,
+              localizationsDelegates: const [
+                GlobalMaterialLocalizations.delegate,
+                GlobalWidgetsLocalizations.delegate,
+                GlobalCupertinoLocalizations.delegate,
+              ],
+              supportedLocales: AppLocaleUtils.supportedLocales,
+              themeMode: themeState.mode,
+              theme: ThemeData(
+                colorScheme: lightScheme,
+                useMaterial3: true,
+                fontFamily: themeState.fontFamilyName,
+                cardTheme: CardThemeData(
+                  elevation: 0,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  color: lightScheme.surfaceContainerLow,
+                  margin: EdgeInsets.zero,
+                ),
               ),
-              color: lightScheme.surfaceContainerLow,
-              margin: EdgeInsets.zero,
-            ),
-          ),
-          darkTheme: ThemeData(
-            colorScheme: darkScheme,
-            useMaterial3: true,
-            fontFamily: themeState.fontFamilyName,
-            cardTheme: CardThemeData(
-              elevation: 0,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(12),
+              darkTheme: ThemeData(
+                colorScheme: darkScheme,
+                useMaterial3: true,
+                fontFamily: themeState.fontFamilyName,
+                cardTheme: CardThemeData(
+                  elevation: 0,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  color: darkScheme.surfaceContainerLow,
+                  margin: EdgeInsets.zero,
+                ),
               ),
-              color: darkScheme.surfaceContainerLow,
-              margin: EdgeInsets.zero,
-            ),
-          ),
-          builder: (context, child) {
-            final brightness = Theme.of(context).brightness;
-            final iconBrightness = brightness == Brightness.light
-                ? Brightness.dark
-                : Brightness.light;
-            // 桌面平台：跟随应用主题明暗切换窗口效果
-            if (Platform.isMacOS || Platform.isWindows || Platform.isLinux) {
-              final isDark = brightness == Brightness.dark;
-              acrylic.Window.setEffect(
-                effect: Platform.isMacOS
-                    ? acrylic.WindowEffect.sidebar
-                    : Platform.isWindows
+              builder: (context, child) {
+                final brightness = Theme.of(context).brightness;
+                final iconBrightness = brightness == Brightness.light
+                    ? Brightness.dark
+                    : Brightness.light;
+                // 桌面平台：跟随应用主题明暗切换窗口效果
+                if (Platform.isMacOS ||
+                    Platform.isWindows ||
+                    Platform.isLinux) {
+                  final isDark = brightness == Brightness.dark;
+                  acrylic.Window.setEffect(
+                    effect: Platform.isMacOS
+                        ? acrylic.WindowEffect.sidebar
+                        : Platform.isWindows
                         ? acrylic.WindowEffect.mica
                         : acrylic.WindowEffect.disabled,
-                dark: isDark,
-              );
-              if (Platform.isMacOS) {
-                acrylic.Window.overrideMacOSBrightness(dark: isDark);
-              }
-            }
-            Widget result = AnnotatedRegion<SystemUiOverlayStyle>(
-              value: SystemUiOverlayStyle(
-                statusBarColor: Colors.transparent,
-                statusBarIconBrightness: iconBrightness,
-                systemNavigationBarIconBrightness: iconBrightness,
-                systemNavigationBarColor: Colors.transparent,
-                // Android 28 上 dividerColor 不能完全透明，用 withAlpha(1) 兼容
-                systemNavigationBarDividerColor: Colors.transparent.withAlpha(
-                  1,
-                ),
-                // 关闭系统自动 scrim，实现完全沉浸
-                systemNavigationBarContrastEnforced: false,
-              ),
-              child: Stack(
-                fit: StackFit.passthrough,
-                children: [child!, const ReadLaterBubble()],
-              ),
-            );
-
-            // 桌面端：全局鼠标返回键 + 键盘快捷键（HardwareKeyboard）
-            if (PlatformUtils.isDesktop) {
-              result = Listener(
-                onPointerDown: (event) {
-                  // 鼠标侧键返回（第 4 按钮，bit flag 0x08）
-                  if (event.buttons & 0x08 != 0) {
-                    navigatorKey.currentState?.maybePop();
+                    dark: isDark,
+                  );
+                  if (Platform.isMacOS) {
+                    acrylic.Window.overrideMacOSBrightness(dark: isDark);
                   }
-                },
-                child: KeyboardShortcutHandler(
-                  navigatorKey: navigatorKey,
-                  child: result,
-                ),
-              );
-            }
+                }
+                Widget result = AnnotatedRegion<SystemUiOverlayStyle>(
+                  value: SystemUiOverlayStyle(
+                    statusBarColor: Colors.transparent,
+                    statusBarIconBrightness: iconBrightness,
+                    systemNavigationBarIconBrightness: iconBrightness,
+                    systemNavigationBarColor: Colors.transparent,
+                    // Android 28 上 dividerColor 不能完全透明，用 withAlpha(1) 兼容
+                    systemNavigationBarDividerColor: Colors.transparent
+                        .withAlpha(1),
+                    // 关闭系统自动 scrim，实现完全沉浸
+                    systemNavigationBarContrastEnforced: false,
+                  ),
+                  child: Stack(
+                    fit: StackFit.passthrough,
+                    children: [child!, const ReadLaterBubble()],
+                  ),
+                );
 
-            return result;
-          },
-          home: const OnboardingGate(child: PreheatGate(child: MainPage())),
+                // 桌面端：全局鼠标返回键 + 键盘快捷键（HardwareKeyboard）
+                if (PlatformUtils.isDesktop) {
+                  result = Listener(
+                    onPointerDown: (event) {
+                      // 鼠标侧键返回（第 4 按钮，bit flag 0x08）
+                      if (event.buttons & 0x08 != 0) {
+                        navigatorKey.currentState?.maybePop();
+                      }
+                    },
+                    child: KeyboardShortcutHandler(
+                      navigatorKey: navigatorKey,
+                      child: result,
+                    ),
+                  );
+                }
+
+                return result;
+              },
+              home: const OnboardingGate(child: PreheatGate(child: MainPage())),
+            ),
+          ),
         );
       },
     );
   }
+}
+
+Future<void> _syncSlangLocale(Locale? locale) async {
+  if (locale == null) {
+    await LocaleSettings.useDeviceLocale();
+    return;
+  }
+
+  final rawLocale = locale.countryCode?.isNotEmpty == true
+      ? '${locale.languageCode}_${locale.countryCode}'
+      : locale.languageCode;
+  await LocaleSettings.setLocaleRaw(rawLocale);
 }
 
 class MainPage extends ConsumerStatefulWidget {
@@ -483,10 +516,7 @@ class MainPage extends ConsumerStatefulWidget {
   ConsumerState<MainPage> createState() => _MainPageState();
 }
 
-enum _AuthErrorDialogAction {
-  confirm,
-  clearData,
-}
+enum _AuthErrorDialogAction { confirm, clearData }
 
 class _MainPageState extends ConsumerState<MainPage>
     with WidgetsBindingObserver {
@@ -525,14 +555,11 @@ class _MainPageState extends ConsumerState<MainPage>
 
       // 初始化 Deep Link 服务
       DeepLinkService.instance.initialize(context);
-
-      // 自动检查更新
-      _autoCheckUpdate();
-
-      // 一次性数据收集告知（仅 Android）
-      if (Platform.isAndroid) {
-        _showCrashlyticsNotice();
-      }
+      unawaited(
+        _runStartupUiTasks().catchError((Object e, StackTrace s) {
+          debugPrint('[MainPage] 启动 UI 任务失败: $e\n$s');
+        }),
+      );
     });
     // 监听登录失效事件
     _authErrorSub = ref.listenManual<AsyncValue<String>>(authErrorProvider, (
@@ -612,6 +639,20 @@ class _MainPageState extends ConsumerState<MainPage>
     await UpdateCheckerHelper.checkUpdateOnStartup(context, updateService);
   }
 
+  Future<void> _runStartupUiTasks() async {
+    // 启动弹窗先于剪贴板提示，避免 SnackBar 被弹窗遮挡后仍被记为已提示。
+    await _autoCheckUpdate();
+    if (!mounted) return;
+
+    // 一次性数据收集告知（仅 Android）
+    if (Platform.isAndroid) {
+      await _showCrashlyticsNotice();
+      if (!mounted) return;
+    }
+
+    await _checkClipboardTopicLink();
+  }
+
   Future<void> _showCrashlyticsNotice() async {
     final prefs = ref.read(sharedPreferencesProvider);
     if (prefs.getBool('crashlytics_notice_shown') ?? false) return;
@@ -676,7 +717,8 @@ class _MainPageState extends ConsumerState<MainPage>
 
     final id = entry.id;
 
-    final isDoubleTap = hasDouble &&
+    final isDoubleTap =
+        hasDouble &&
         _lastTappedIndex == index &&
         _lastTapTime != null &&
         now.difference(_lastTapTime!).inMilliseconds < 300;
@@ -778,8 +820,63 @@ class _MainPageState extends ConsumerState<MainPage>
         ConnectivityService().check();
         // 恢复 cf_clearance 自动续期监控
         CfClearanceRefreshService().resume();
+        _checkClipboardTopicLink();
       });
     }
+  }
+
+  Future<void> _checkClipboardTopicLink() async {
+    final prefs = ref.read(sharedPreferencesProvider);
+    final clipboardTopicLinkService = ClipboardTopicLinkService.instance;
+    final candidate = await clipboardTopicLinkService.checkClipboard(
+      enabled: ref.read(preferencesProvider).clipboardTopicLinkDetection,
+      lastPromptedHash: prefs.getInt(
+        ClipboardTopicLinkService.lastPromptedHashPrefsKey,
+      ),
+    );
+    if (!mounted || candidate == null) return;
+
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    if (messenger == null) return;
+
+    var promptHandled = false;
+    void markPromptedOnce() {
+      if (promptHandled) return;
+      promptHandled = true;
+      unawaited(
+        clipboardTopicLinkService.markPrompted(candidate, prefs: prefs),
+      );
+    }
+
+    messenger.hideCurrentSnackBar();
+    final controller = messenger.showSnackBar(
+      SnackBar(
+        content: ClipboardTopicLinkSnackContent(
+          message: context.l10n.preferences_clipboardTopicLink_detected,
+          actionLabel: context.l10n.preferences_clipboardTopicLink_open,
+          onOpen: () {
+            markPromptedOnce();
+            messenger.hideCurrentSnackBar();
+            DeepLinkService.instance.handleUri(candidate.uri);
+          },
+          onDismiss: () {
+            markPromptedOnce();
+            messenger.hideCurrentSnackBar();
+          },
+        ),
+        behavior: SnackBarBehavior.floating,
+        backgroundColor: Colors.transparent,
+        duration: const Duration(seconds: 8),
+        elevation: 0,
+        padding: EdgeInsets.zero,
+        margin: EdgeInsets.only(
+          left: 16,
+          right: 16,
+          bottom: 16 + MediaQuery.paddingOf(context).bottom,
+        ),
+      ),
+    );
+    unawaited(controller.closed.then((_) => markPromptedOnce()));
   }
 
   /// App 进入后台：先启动前台服务保活，再切换到只轮询通知频道
@@ -804,8 +901,8 @@ class _MainPageState extends ConsumerState<MainPage>
   Future<void> _handleAuthError(String message) async {
     if (!mounted) return;
 
-    final advice =
-        AuthIssueNoticeService.instance.consumeLatestPassiveLogoutAdvice();
+    final advice = AuthIssueNoticeService.instance
+        .consumeLatestPassiveLogoutAdvice();
     final content = _buildAuthErrorDialogMessage(message, advice);
 
     final action = await showAppDialog<_AuthErrorDialogAction>(
@@ -817,17 +914,13 @@ class _MainPageState extends ConsumerState<MainPage>
         actions: [
           if (advice.suggestClearData)
             TextButton(
-              onPressed: () => Navigator.pop(
-                context,
-                _AuthErrorDialogAction.clearData,
-              ),
+              onPressed: () =>
+                  Navigator.pop(context, _AuthErrorDialogAction.clearData),
               child: Text(S.current.auth_clearDataAction),
             ),
           FilledButton(
-            onPressed: () => Navigator.pop(
-              context,
-              _AuthErrorDialogAction.confirm,
-            ),
+            onPressed: () =>
+                Navigator.pop(context, _AuthErrorDialogAction.confirm),
             child: Text(S.current.common_confirm),
           ),
         ],
@@ -843,9 +936,9 @@ class _MainPageState extends ConsumerState<MainPage>
       navigatorKey.currentState?.popUntil((route) => route.isFirst);
     }
     if (mounted && action == _AuthErrorDialogAction.clearData) {
-      await Navigator.of(context).push(
-        MaterialPageRoute(builder: (_) => const DataManagementPage()),
-      );
+      await Navigator.of(
+        context,
+      ).push(MaterialPageRoute(builder: (_) => const DataManagementPage()));
     }
   }
 
@@ -880,8 +973,9 @@ class _MainPageState extends ConsumerState<MainPage>
     _lastResolvedEntries = entries;
 
     // page kind 的子集用于 IndexedStack
-    final pageEntries =
-        entries.where((e) => e.kind == NavEntryKind.page).toList();
+    final pageEntries = entries
+        .where((e) => e.kind == NavEntryKind.page)
+        .toList();
 
     // _currentIndex 维度是 pageEntries；越界时 clamp
     final safePageIndex = pageEntries.isEmpty
@@ -895,9 +989,7 @@ class _MainPageState extends ConsumerState<MainPage>
 
     // 监听外部 tab 切换信号（快捷键触发），index 维度是 pageEntries
     ref.listen(switchTabProvider, (_, index) {
-      if (index >= 0 &&
-          index < pageEntries.length &&
-          index != _currentIndex) {
+      if (index >= 0 && index < pageEntries.length && index != _currentIndex) {
         ref.read(barVisibilityProvider.notifier).state = 1.0;
         setState(() => _currentIndex = index);
       }
